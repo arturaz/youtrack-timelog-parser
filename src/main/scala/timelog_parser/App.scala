@@ -55,12 +55,12 @@ object App extends SafeApp {
   val JustNowRe = """.*just now$""".r
   val MinutesAgoRe = """.*(\d+) minutes ago$""".r
   val HoursAgoRe = """.*(\d+) hours ago$""".r
+  val WorkRe = """^\s?Work: (.+?) (?:-|to) (.+)$""".r
 
   object TimeMatcher {
+    val TimeRe = """^((\d+) hours? ?)?((\d+) min)?$""".r
     val OnlyHoursRe: Regex = """^(\d+) hours$""".r
     val OnlyMinutesRe: Regex = """^(\d+) min$""".r
-    val TimeRe: Regex = """^(\d+) hours (\d+) min$""".r
-    val WorkRe = """^\s?Work: (.+?) (?:-|to) (.+)$""".r
 
     def unapply(arg: String): Option[(Int, Int)] = arg match {
       case TimeRe(hoursS, minutesS) => Some((hoursS.toInt, minutesS.toInt))
