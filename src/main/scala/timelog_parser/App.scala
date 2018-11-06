@@ -7,7 +7,7 @@ import java.util.concurrent.TimeUnit
 import scala.annotation.tailrec
 import scala.concurrent.duration._
 import scala.util.Try
-import scalaz.{\/, ImmutableArray, ValidationNel}
+import scalaz.{ImmutableArray, ValidationNel, \/}
 import scalaz.syntax.either._
 import scalaz.syntax.validation._
 import scalaz.syntax.std.option._
@@ -16,6 +16,8 @@ import scalaz.syntax.applicative._
 import scalaz.std.vector._
 import scalaz.effect._
 import scalaz.stream._
+
+import scala.util.matching.Regex
 
 object WorkflowDateRange {
   def create(start: ZonedDateTime, end: ZonedDateTime): String \/ WorkflowDateRange = {
@@ -54,8 +56,19 @@ object App extends SafeApp {
   val MinutesAgoRe = """.*(\d+) minutes ago$""".r
   val HoursAgoRe = """.*(\d+) hours ago$""".r
 
-  val TimeRe = """^((\d+) hours? ?)?((\d+) min)?$""".r
-  val WorkRe = """^\s?Work: (.+?) (?:-|to) (.+)$""".r
+  object TimeMatcher {
+    val OnlyHoursRe: Regex = """^(\d+) hours$""".r
+    val OnlyMinutesRe: Regex = """^(\d+) min$""".r
+    val TimeRe: Regex = """^(\d+) hours (\d+) min$""".r
+    val WorkRe = """^\s?Work: (.+?) (?:-|to) (.+)$""".r
+
+    def unapply(arg: String): Option[(Int, Int)] = arg match {
+      case TimeRe(hoursS, minutesS) => Some((hoursS.toInt, minutesS.toInt))
+      case OnlyHoursRe(intS) => Some((intS.toInt, 0))
+      case OnlyMinutesRe(intS) => Some((0, intS.toInt))
+      case _ => None
+    }
+  }
 
   override def run(args: ImmutableArray[String]) = {
     for {
@@ -163,26 +176,12 @@ object App extends SafeApp {
             )
             .map(v => Vector(WorkEntry.ExactTime(v)))
           (rest, current +++ entry)
-        case (line @ TimeRe(_, hoursS, _, minutesS), rest) =>
-          def parseInt(s: String, name: String) =
-            if (s == null) 0.success
-            else s.parseInt.leftMap { err =>
-              s"Error while parsing '$s' as $name: $err"
-            }
-
-          val durationV = (
-            parseInt(hoursS, "hours").toValidationNel |@|
-            parseInt(minutesS, "minutes").toValidationNel
-          ) { (hours, minutes) =>
+        case (TimeMatcher(hours, minutes), rest) =>
+          val duration =
             FiniteDuration(hours, TimeUnit.HOURS) +
             FiniteDuration(minutes, TimeUnit.MINUTES)
-          }
 
-          val entry =
-            durationV
-            .leftMap(errs => errs.map(s"Error while parsing '$line' as time: " + _))
-            .map(duration => Vector(WorkEntry.YouTrack(date, duration)))
-          (rest, current +++ entry)
+          (rest, current.map(_ :+ WorkEntry.YouTrack(date, duration)))
       }
     }
 
