@@ -1,10 +1,12 @@
 package timelog_parser
 
 import java.time._
-import scalaz.std.vector._, scalaz.syntax.validation._
 
+import scalaz.std.vector._
+import scalaz.syntax.validation._
 import org.specs2.mutable.Specification
-import timelog_parser.WorkEntry.ExactTime
+import scala.concurrent.duration._
+import timelog_parser.WorkEntry.{ExactTime, YouTrack}
 
 class AppTest extends Specification {
   def splitLines(s: String): Vector[String] = s.split("[\r\n]+").toVector
@@ -183,6 +185,46 @@ No type: 2 hours 34 minutes on 2018-10-30
     val expected = Vector(ExactTime(WorkflowDateRange(
       date(2018, 10, 30, 18, 19, 29, 2),
       date(2018, 10, 30, 20, 54, 13, 2),
+    ))).successNel[String]
+    result must_=== expected
+  }
+
+  "new style #2 without comment should parse" >> {
+    val lines = splitLines(
+      s"""
+2019-01-28
+|
+8h53m
+|
+No type
+|
+some random comment
+       """
+    )
+    val result = App.process(lines)
+    val expected = Vector(YouTrack(
+      LocalDate.of(2019, 1, 28),
+      8.hours + 53.minutes
+    )).successNel[String]
+    result must_=== expected
+  }
+
+  "new style #2 with work comment should parse" >> {
+    val lines = splitLines(
+      s"""
+2019-01-28
+|
+8h53m
+|
+No type
+|
+Work: 2019-1-28 09:52:05 +0200 to 2019-1-28 18:46:00 +0200
+       """
+    )
+    val result = App.process(lines)
+    val expected = Vector(ExactTime(WorkflowDateRange(
+      date(2019, 1, 28, 9, 52, 5, 2),
+      date(2019, 1, 28, 18, 46, 0, 2)
     ))).successNel[String]
     result must_=== expected
   }

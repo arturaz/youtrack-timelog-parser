@@ -9,6 +9,7 @@ import scala.concurrent.duration._
 import scala.util.Try
 import scalaz.{ImmutableArray, ValidationNel, \/}
 import scalaz.syntax.either._
+import scalaz.syntax.traverse._
 import scalaz.syntax.validation._
 import scalaz.syntax.std.option._
 import scalaz.std.string.stringSyntax._
@@ -50,20 +51,39 @@ object WorkEntry {
 }
 
 object App extends SafeApp {
-  val DateRe = """^\d{2} \w{3} \d{4}$""".r
   val DateTimeRe = """^.*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})$""".r
   val JustNowRe = """.*just now$""".r
   val MinutesAgoRe = """.*(\d+) minutes ago$""".r
   val HoursAgoRe = """.*(\d+) hours ago$""".r
   val WorkRe = """^\s?Work: (.+?) (?:-|to) (.+)$""".r
 
+  object DateMatcher {
+    val DateRe = """^\d{2} \w{3} \d{4}$""".r
+    val Date2Re = """^\d{4}-\d{2}-\d{2}$""".r
+
+    def unapply(arg: String): Option[LocalDate] = {
+      arg match {
+        case DateRe() =>
+          Some(LocalDate.parse(arg, Formats.DateFormat))
+        case Date2Re() =>
+          Some(LocalDate.parse(arg))
+        case _ =>
+          None
+      }
+    }
+  }
+
   object TimeMatcher {
-    val TimeRe = """^((\d+) hours? ?)?((\d+) min)?$""".r
+    val TimeRe = """^(?:(\d+) hours? ?)?(?:(\d+) min)?$""".r
+    val Time2Re = """^(?:(\d+)h?)?(?:(\d+)m)?$""".r
     val OnlyHoursRe: Regex = """^(\d+) hours$""".r
     val OnlyMinutesRe: Regex = """^(\d+) min$""".r
 
     def unapply(arg: String): Option[(Int, Int)] = arg match {
       case TimeRe(hoursS, minutesS) => Some((hoursS.toInt, minutesS.toInt))
+      case Time2Re(hoursS, minutesS) =>
+        println(hoursS + minutesS)
+        Some((hoursS.toInt, minutesS.toInt))
       case OnlyHoursRe(intS) => Some((intS.toInt, 0))
       case OnlyMinutesRe(intS) => Some((0, intS.toInt))
       case _ => None
@@ -114,78 +134,110 @@ object App extends SafeApp {
     }.toRightDisjunction(s"Can't parse $s as date time with ${Formats.WorkEntryFormats}")
 
   type Lines = Vector[String]
+  type ProcessEntry = ValidationNel[String, WorkEntry]
   type ProcessResult = ValidationNel[String, Vector[WorkEntry]]
-  def process(lines: Lines): ProcessResult = {
-    type Result = (Lines, ProcessResult)
 
-    @tailrec def onLine(
-      lines: Lines, current: ProcessResult
-    )(
-      f: PartialFunction[(String, Lines), Result]
-    ): Result = {
-      if (lines.isEmpty) (lines, current)
+  sealed trait Parser {
+    def apply(line: String): (Vector[ProcessEntry], Parser)
+    def finish(): Vector[ProcessEntry]
+  }
+  case class HasDateParser(date: LocalDate) extends Parser {
+    def apply(line: String) = {
+      line match {
+        case WorkRe(start, end) =>
+          val entry = HasDateParser.matchWork(line, start, end)
+          (Vector(entry), StartingParser)
+
+        case TimeMatcher(hours, minutes) =>
+          val duration =
+            FiniteDuration(hours, TimeUnit.HOURS) + FiniteDuration(minutes, TimeUnit.MINUTES)
+
+//          (Vector(WorkEntry.YouTrack(date, duration).successNel), StartingParser)
+          (Vector.empty, HasTimeParser(WorkEntry.YouTrack(date, duration)))
+        case _ =>
+          (Vector.empty, this)
+      }
+    }
+
+    override def finish() = Vector.empty
+  }
+  object HasDateParser {
+    def matchWork(line: String, start: String, end: String) = {
+      val startV = parseDate(start).validationNel
+      val endV = parseDate(end).validationNel
+      val entry =
+        (startV |@| endV) { WorkflowDateRange.create }.fold(
+          errs => errs.map(err => s"Error while parsing '$line' as work: $err").failure,
+          either => either.validationNel
+        ).map(WorkEntry.ExactTime.apply)
+      entry
+    }
+  }
+  case class HasTimeParser(entry: WorkEntry.YouTrack) extends Parser {
+    def apply(line: String) = {
+      line match {
+        case WorkRe(start, end) =>
+          val entry = HasDateParser.matchWork(line, start, end)
+          (Vector(entry), StartingParser)
+        case _ =>
+          val (results, nextParser) = StartingParser(line)
+          if (nextParser == StartingParser) {
+            (results, this)
+          }
+          else {
+            // Found a date
+            (entry.successNel[String] +: results, nextParser)
+          }
+      }
+    }
+
+    override def finish() = Vector(entry.successNel)
+  }
+  object StartingParser extends Parser {
+    def apply(line: String) = {
+      line match {
+        case DateMatcher(date) =>
+          (Vector.empty, HasDateParser(date))
+
+        case JustNowRe() =>
+          val date = LocalDate.now()
+          (Vector.empty, HasDateParser(date))
+
+        case MinutesAgoRe(minutes) =>
+          val dateTime = LocalDateTime.now().minus(minutes.toLong, ChronoUnit.MINUTES)
+          (Vector.empty, HasDateParser(dateTime.toLocalDate))
+
+        case HoursAgoRe(hours) =>
+          val dateTime = LocalDateTime.now().minus(hours.toLong, ChronoUnit.HOURS)
+          (Vector.empty, HasDateParser(dateTime.toLocalDate))
+
+        case DateTimeRe(date) =>
+          val dateTime = LocalDateTime.parse(date)
+          (Vector.empty, HasDateParser(dateTime.toLocalDate))
+
+        case _ =>
+          (Vector.empty, this)
+      }
+    }
+
+    override def finish() = Vector.empty
+  }
+
+  def process(lines: Lines): ProcessResult = {
+    @tailrec def rec(
+      lines: Lines, parser: Parser, current: ProcessResult
+    ): ProcessResult = {
+      if (lines.isEmpty) current +++ parser.finish().sequenceU
       else {
         val line = lines.head
         val rest = lines.tail
-        f.lift((line, rest)) match {
-          case None => onLine(rest, current)(f)
-          case Some(result) => result
-        }
+        val (results, nextParser) = parser(line)
+        val sequencedResults = results.sequenceU
+        rec(rest, nextParser, current +++ sequencedResults)
       }
     }
 
-    @tailrec def starting(
-      lines: Lines, current: ProcessResult
-    ): ProcessResult = {
-      val (restOfLines, newCurrent) = onLine(lines, current) {
-        case (line @ DateRe(), rest) =>
-          val date = LocalDate.parse(line, Formats.DateFormat)
-          hasDate(date, rest, current)
-
-        case (JustNowRe(), rest) =>
-          val date = LocalDate.now()
-          hasDate(date, rest, current)
-
-        case (MinutesAgoRe(minutes), rest) =>
-          val dateTime = LocalDateTime.now().minus(minutes.toLong, ChronoUnit.MINUTES)
-          hasDate(dateTime.toLocalDate, rest, current)
-
-        case (HoursAgoRe(hours), rest) =>
-          val dateTime = LocalDateTime.now().minus(hours.toLong, ChronoUnit.HOURS)
-          hasDate(dateTime.toLocalDate, rest, current)
-
-        case (DateTimeRe(date), rest) =>
-          val dateTime = LocalDateTime.parse(date)
-          hasDate(dateTime.toLocalDate, rest, current)
-      }
-      if (restOfLines.isEmpty) newCurrent
-      else starting(restOfLines, newCurrent)
-    }
-
-    def hasDate(
-      date: LocalDate, lines: Lines, current: ProcessResult
-    ): Result = {
-      onLine(lines, current) {
-        case (line @ WorkRe(start, end), rest) =>
-          val startV = parseDate(start).validationNel
-          val endV = parseDate(end).validationNel
-          val entry =
-            (startV |@| endV) { WorkflowDateRange.create }.fold(
-              errs => errs.map(err => s"Error while parsing '$line' as work: $err").failure,
-              either => either.validationNel
-            )
-            .map(v => Vector(WorkEntry.ExactTime(v)))
-          (rest, current +++ entry)
-        case (TimeMatcher(hours, minutes), rest) =>
-          val duration =
-            FiniteDuration(hours, TimeUnit.HOURS) +
-            FiniteDuration(minutes, TimeUnit.MINUTES)
-
-          (rest, current.map(_ :+ WorkEntry.YouTrack(date, duration)))
-      }
-    }
-
-    starting(lines, Vector.empty[WorkEntry].successNel)
+    rec(lines, StartingParser, Vector.empty[WorkEntry].successNel)
   }
 
   def workedPerDay(entries: Vector[WorkEntry]): Map[Int, FiniteDuration] =
